@@ -120,7 +120,7 @@ def load_smiles_table(path: str):
     if is_parquet:
         # Dask DataFrame (lazy, out-of-core). Only load the two needed columns.
         ddf = dd.read_parquet(path, columns=["smiles", "zinc_id"])
-        return ddf  # <-- IMPORTANT: return the Dask DataFrame
+        return ddf  
     else:
         # Legacy pickle path (returns pandas DataFrame)
         df = pd.read_pickle(path)

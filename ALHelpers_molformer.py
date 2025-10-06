@@ -39,6 +39,245 @@ from FinalDocking import get_topK_mols
 #     print('Loaded molecule_df from pickle in', time.time() - t0)
 #     return molecule_df
 
+def _is_dask_df(df):
+    try:
+        import dask.dataframe as dd
+        return isinstance(df, dd.DataFrame)
+    except Exception:
+        return False
+
+import math
+import numpy as np
+import pandas as pd
+import dask.dataframe as dd
+
+import duckdb
+
+def sample_n_parquet_duckdb(parquet_path_or_glob: str,
+                            n: int,
+                            columns=("smiles","zinc_id"),
+                            used_ids: list[str] | None = None,
+                            seed: int | None = None,
+                            threads: int | None = None) -> pd.DataFrame:
+    con = duckdb.connect()
+    # cap threads to what the job can actually use (optional but handy on SLURM)
+    if threads is None:
+        threads = os.cpu_count() or 1
+    con.execute(f"PRAGMA threads={int(threads)}")
+    con.execute("SET enable_progress_bar=true")
+
+    if seed is None:
+        seed = 0
+
+    cols_sql = ", ".join(columns)
+
+    if used_ids:
+        # Register small in-memory table and pre-filter in a subquery
+        con.register("used_ids_df", pd.DataFrame({"zinc_id": list(used_ids)}))
+        q = f"""
+        SELECT {cols_sql}
+        FROM (
+            SELECT {cols_sql}
+            FROM read_parquet('{parquet_path_or_glob}') t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM used_ids_df u WHERE u.zinc_id = t.zinc_id
+            )
+        ) s
+        USING SAMPLE reservoir({n} ROWS)
+        REPEATABLE ({seed})
+        """
+    else:
+        q = f"""
+        SELECT {cols_sql}
+        FROM read_parquet('{parquet_path_or_glob}')
+        USING SAMPLE reservoir({n} ROWS)
+        REPEATABLE ({seed})
+        """
+
+    print("Finished sampling from parquet using duckdb")
+    return con.execute(q).df()
+
+
+def _to_pandas_batch_duckdb(parquet_path_or_glob, n, random_state=None,
+                            used_ids=None, columns=("smiles","zinc_id")):
+    return sample_n_parquet_duckdb(
+        parquet_path_or_glob,
+        n,
+        columns=columns,
+        used_ids=list(used_ids) if used_ids else None,
+        seed=(0 if random_state is None else int(random_state)),
+        threads=None  # or set to your core count
+    )
+
+def _to_pandas_batch(ddf, n, random_state=None, used_ids=None, oversample=1.15):
+    """
+    Return ~n random rows as a *pandas* DataFrame from a Dask DataFrame.
+    Uses frac-sampling (Dask limitation), oversamples a bit, computes,
+    then trims to exact n.
+    """
+    if used_ids is not None and len(used_ids):
+        ddf = ddf[~ddf["zinc_id"].isin(list(used_ids))]
+
+    # Fast row count (usually from Parquet metadata)
+    try:
+        total = int(ddf.shape[0].compute())
+    except Exception:
+        total = None
+
+    if not total or total <= 0:
+        # return empty pandas DF with same columns
+        return pd.DataFrame(columns=list(ddf.columns))
+
+    # compute sampling fraction; oversample slightly so we have >= n after compute
+    frac = min(1.0, (n * oversample) / total)
+
+    # Dask supports only frac= (not n=); this is approximate per-partition
+    samp_ddf = ddf.sample(frac=frac, replace=False, random_state=random_state)
+    print("Finishing a pandas batch from dask")
+    # materialize to pandas; should be ~ n * oversample rows
+    pdf = samp_ddf.compute()
+
+    # ensure exactly n rows if possible
+    if len(pdf) > n:
+        pdf = pdf.sample(n=n, random_state=random_state)
+    # if it's still < n (tiny pool), just return what we have
+    return pdf
+
+def fetch_random_splits(
+    train_n: int,
+    val_n: int,
+    test_n: int,
+    molecule_df,
+    used_zinc_ids: set,
+    *,
+    fingerprint: bool = False,
+    init_acq: bool = False,
+    tokenizer=None,
+    config=None,
+    random_state: int | None = None,
+):
+    """
+    Fetch exactly train/val/test batches from the library with ONE sample call.
+
+    Returns:
+      if fingerprint=True:
+         ((train_list, val_list, test_list), used_zinc_ids)
+         where each list is [(zinc_id, smiles, dense_fp), ...]
+      else:
+         ((train_tuple, val_tuple, test_tuple), used_zinc_ids)
+         where each tuple is (zinc_list, smiles_list, token_batch)
+
+    Notes:
+      - For Dask-backed datasets, sampling is done once via DuckDB reservoir(N ROWS).
+      - For pandas-backed datasets, sampling is done once via pandas .sample().
+      - Rows in used_zinc_ids are excluded before sampling.
+      - If init_acq=True, sampled zinc_ids are added to used_zinc_ids.
+    """
+    import numpy as np
+    import pandas as pd
+
+    total_needed = int(train_n) + int(val_n) + int(test_n)
+    if total_needed <= 0:
+        raise ValueError("Sum of train_n + val_n + test_n must be > 0")
+
+    # Helper to convert a pandas DF slice into the desired batch format
+    def _df_to_batch(df_slice: pd.DataFrame):
+        nonlocal used_zinc_ids
+        if fingerprint:
+            out = []
+        else:
+            zinc_list, smiles_list = [], []
+
+        for _, row in df_slice.iterrows():
+            z = row["zinc_id"]
+            s = row["smiles"]
+
+            # (defensive) skip anything already used
+            if z in used_zinc_ids:
+                continue
+
+            if init_acq:
+                used_zinc_ids.add(z)
+
+            if fingerprint:
+                # optional sparse->dense conversion if "indices" present
+                indices = row.get("indices", None)
+                if indices is None:
+                    # if no fingerprint available, skip or create empty-onehot
+                    # here we skip to avoid shape mismatches
+                    continue
+                idx = (np.frombuffer(indices, dtype=np.int32)
+                       if isinstance(indices, (bytes, bytearray))
+                       else np.asarray(indices, dtype=np.int32))
+                dense_fp = np.zeros((1, 2048), dtype=np.float32)
+                dense_fp[0, idx] = 1.0
+                out.append((z, s, dense_fp))
+            else:
+                zinc_list.append(z)
+                smiles_list.append(s)
+
+        if fingerprint:
+            return out
+        else:
+            if tokenizer is None:
+                raise ValueError("tokenizer must be provided when fingerprint=False")
+            token_batch = tokenizer(smiles_list, padding=True, truncation=True, return_tensors="pt")
+            return (zinc_list, smiles_list, token_batch)
+
+    # --- Single sampling step ---
+    is_dask = hasattr(molecule_df, "compute") and "dask" in type(molecule_df).__module__
+
+    if is_dask:
+        if config is None or not hasattr(config, "global_params"):
+            raise ValueError("config with global_params.dataset_path is required for Dask-backed data.")
+        # Use DuckDB-based single-pass exact-N sampling with exclusion
+        df_all = _to_pandas_batch_duckdb(
+            config.global_params.dataset_path,
+            n=total_needed,
+            random_state=random_state,
+            used_ids=list(used_zinc_ids),
+            columns=("smiles", "zinc_id"),
+        )
+    else:
+        # pandas path: exclude and sample once
+        avail_df = molecule_df[~molecule_df["zinc_id"].isin(used_zinc_ids)]
+        take = min(total_needed, len(avail_df))
+        if take == 0:
+            # Return empty structures of the right shapes
+            if fingerprint:
+                empty = []
+                return ((empty, empty, empty), used_zinc_ids)
+            else:
+                empty = ([], [], tokenizer([], padding=True, truncation=True, return_tensors="pt"))
+                return ((empty, empty, empty), used_zinc_ids)
+        df_all = avail_df.sample(n=take, random_state=random_state).reset_index(drop=True)
+
+    # If we got fewer than requested rows (e.g., near exhaustion), pad splits accordingly
+    got = len(df_all)
+    if got < total_needed:
+        # shrink splits proportionally (preserve order: train -> val -> test)
+        scale = got / total_needed
+        train_take = int(round(train_n * scale))
+        val_take   = int(round(val_n * scale))
+        # ensure sum == got
+        if train_take + val_take > got:
+            val_take = max(0, got - train_take)
+        test_take  = max(0, got - train_take - val_take)
+    else:
+        train_take, val_take, test_take = train_n, val_n, test_n
+
+    # deterministic split order (shuffle beforehand by sample random_state)
+    train_df = df_all.iloc[0:train_take]
+    val_df   = df_all.iloc[train_take:train_take+val_take]
+    test_df  = df_all.iloc[train_take+val_take:train_take+val_take+test_take]
+
+    # Convert slices to requested outputs
+    train_out = _df_to_batch(train_df)
+    val_out   = _df_to_batch(val_df)
+    test_out  = _df_to_batch(test_df)
+
+    return (train_out, val_out, test_out), used_zinc_ids
+
 def clear_iter(iteration_path, model_clean=False):
     delete_files = glob.glob(iteration_path+'/used_zinc_ids_*.pkl')
     delete_files.extend(glob.glob(iteration_path+'/split_mol_df_*.csv'))
@@ -120,7 +359,7 @@ def write_inf_helper_script(iteration_dir, config):
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
-#SBATCH --mem=10000M
+#SBATCH --mem=20000M
 #SBATCH -o {iteration_dir}/inference_%A_%a.out
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate {config.global_params.env_name}
@@ -133,36 +372,56 @@ python ~/phd/ddlight/ALMolformer_inference_helper.py $SLURM_ARRAY_TASK_ID {itera
         f.write(script_content)
     return script_file
 
-def fetch_random_batch(batch_size, molecule_df, used_zinc_ids, fingerprint = False, init_acq=False, tokenizer=None):
-    """Fetch a random batch directly from the DataFrame."""
-    fetched_batch, zinc_list, smiles_list = [],[],[]
-    rnd_state = 420 if init_acq else None 
-    # Filter the DataFrame to exclude the used zinc_ids
-    available_df = molecule_df[~molecule_df['zinc_id'].isin(used_zinc_ids)]
-    while len(fetched_batch) < batch_size and not available_df.empty:
-        # Randomly sample batches from the available DataFrame
-        sampled_batch = available_df.sample(n=min(batch_size - len(fetched_batch), len(available_df)), random_state= rnd_state)
-        # print(f'alhelpers.py availabledf {len(available_df)}, sampled_batch {len(sampled_batch)}')
-        for _, row in sampled_batch.iterrows():
-            zinc_id, smiles = row['zinc_id'], row['smiles']
-            if zinc_id not in used_zinc_ids:
-                if init_acq:
-                    used_zinc_ids.add(zinc_id)
-                if fingerprint:
-                    indices = np.frombuffer(row['indices'], dtype=np.int32)
-                    dense_fp = np.zeros((1, 2048))
-                    dense_fp[0, indices] = 1
-                    fetched_batch.append((zinc_id, smiles, dense_fp))
-                else:
-                    zinc_list.append(zinc_id)
-                    smiles_list.append(smiles)
-                    fetched_batch = zinc_list # dummy fetched batch to get out of while loop when enough samples are accumulated
-    if not fingerprint:
-        dense_fp = tokenizer(smiles_list, padding=True, truncation=True, return_tensors="pt")
-        fetched_batch = (zinc_list, smiles_list, dense_fp)
+def fetch_random_batch(batch_size, molecule_df, used_zinc_ids, fingerprint=False, init_acq=False, tokenizer=None, config=None):
+    """Fetch a random batch from (pandas or Dask) molecule_df, excluding used_zinc_ids.
+       Returns:
+         - if fingerprint=True: [(zinc_id, smiles, dense_fp), ...], used_zinc_ids
+         - else: (zinc_list, smiles_list, token_batch), used_zinc_ids
+    """
+    fetched_batch, zinc_list, smiles_list = [], [], []
+    rnd_state = 420 if init_acq else None
 
-        # # Update available_df to exclude the sampled batch
-        # available_df = available_df[~available_df['zinc_id'].isin(fetched_batch)]
+    is_dask = hasattr(molecule_df, "compute") and "dask" in type(molecule_df).__module__
+
+    if is_dask:
+        # Lazily filter, then pull an exact-size pandas batch efficiently
+        df = _to_pandas_batch_duckdb(
+            config.global_params.dataset_path,
+            n=batch_size,
+            random_state=rnd_state,
+            used_ids=list(used_zinc_ids)
+        )
+    else:
+        avail_df = molecule_df[~molecule_df["zinc_id"].isin(used_zinc_ids)]
+        if len(avail_df) == 0:
+            df = avail_df
+        else:
+            df = avail_df.sample(n=min(batch_size, len(avail_df)), random_state=rnd_state)
+
+    for _, row in df.iterrows():
+        z, s = row["zinc_id"], row["smiles"]
+        if z in used_zinc_ids:
+            continue
+        if init_acq:
+            used_zinc_ids.add(z)
+
+        if fingerprint:
+            indices = row.get("indices", None)
+            if indices is None:
+                continue
+            idx = (np.frombuffer(indices, dtype=np.int32)
+                   if isinstance(indices, (bytes, bytearray))
+                   else np.asarray(indices, dtype=np.int32))
+            dense_fp = np.zeros((1, 2048), dtype=np.float32)
+            dense_fp[0, idx] = 1.0
+            fetched_batch.append((z, s, dense_fp))
+        else:
+            zinc_list.append(z)
+            smiles_list.append(s)
+
+    if not fingerprint:
+        token_batch = tokenizer(smiles_list, padding=True, truncation=True, return_tensors="pt")
+        return (zinc_list, smiles_list, token_batch), used_zinc_ids
 
     return fetched_batch, used_zinc_ids
 
@@ -241,9 +500,9 @@ def run_first_iteration(config, total_size, molecule_df, used_zinc_ids, smiles_2
         fingerprint = True 
     elif config.global_params.model_architecture in ('advanced_molformer'):
         fingerprint = False
-    train_batch,used_zinc_ids = fetch_random_batch(total_size, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer = tokenizer)
-    val_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_val_budget, molecule_df, used_zinc_ids, init_acq= True, fingerprint=fingerprint, tokenizer=tokenizer)
-    test_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_test_budget, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer=tokenizer)
+    train_batch,used_zinc_ids = fetch_random_batch(total_size, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer = tokenizer, config=config)
+    val_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_val_budget, molecule_df, used_zinc_ids, init_acq= True, fingerprint=fingerprint, tokenizer=tokenizer, config=config)
+    test_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_test_budget, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer=tokenizer, config=config)
     
     print("First Iteration:")
     print(f"Train Batch Size: {len(train_batch[0])}")
@@ -338,46 +597,52 @@ def run_first_iteration(config, total_size, molecule_df, used_zinc_ids, smiles_2
     return EasyDict(data_dict), used_zinc_ids
 
 
-def fetch_unlabeled_batch(limit, offset, molecule_df, used_zinc_ids, fingerprint=True, tokenizer= None):
-    """Fetch a batch of unlabeled molecules from the DataFrame."""
-    fetched_batch = []
+def fetch_unlabeled_batch(limit, offset, molecule_df, used_zinc_ids, fingerprint=True, tokenizer=None, config=None):
+    """
+    Build a small unlabeled batch. For Dask, we avoid .iloc/len and take a random n=limit sample
+    from the remaining pool (offset is ignored in Dask mode).
+    Returns:
+      fetched_batch, len_available, data_finish_flag
+    where:
+      - if fingerprint=True: fetched_batch = [(zinc_id, smiles, dense_fp), ...]
+      - else: fetched_batch = (zinc_list, smiles_list, token_batch)
+      - len_available: int for pandas; np.nan for Dask (cheaply unknown)
+      - data_finish_flag: False for Dask (unknown cheaply); pandas version preserves logic
+    """
+    if _is_dask_df(molecule_df):
+        # Dask path: random n=limit without expensive offset slicing
+        batch_df = _to_pandas_batch_duckdb(config.global_params.dataset_path, n=limit, used_ids=used_zinc_ids)
+        len_available   = np.nan   # computing exact length is costly; avoid full scan
+        data_finish_flag = False   # unknown cheaply in streaming mode
+    else:
+        # pandas path: preserve previous semantics
+        available_df = molecule_df[~molecule_df['zinc_id'].isin(used_zinc_ids)]
+        len_available = len(available_df)
+        batch_df = available_df.iloc[offset:offset + limit]
+        data_finish_flag = (offset + limit) >= len_available
 
-    # Filter the DataFrame to exclude the used zinc_ids
-    available_df = molecule_df[~molecule_df['zinc_id'].isin(used_zinc_ids)]
+    smiles_list, zinc_list, fetched_batch = [], [], []
 
-    # Apply limit and offset for the batch
-    batch_df = available_df.iloc[offset:offset+limit]
-    smiles_list, zinc_list =[],[]
-    # data_finish_flag = offset+limit == len(available_df)
-    print('offset+limit ', offset+limit, 'available df ',len(available_df))
     for _, row in batch_df.iterrows():
-        zinc_id = row['zinc_id']
-        smiles = row['smiles']
-        
+        z = row['zinc_id']; s = row['smiles']
+        if z in used_zinc_ids:
+            continue
         if fingerprint:
-            indices_blob = row['indices']
-            if zinc_id not in used_zinc_ids:
-                # Convert binary blobs back to their original arrays
-                indices = np.frombuffer(indices_blob, dtype=np.int32)
-                dense_fp = np.zeros((1, 2048))
-                dense_fp[0, indices] = 1
-                fetched_batch.append((zinc_id, smiles, dense_fp))
+            indices = row.get('indices', None)
+            if indices is None:
+                continue
+            idx = np.frombuffer(indices, dtype=np.int32) if isinstance(indices, (bytes, bytearray)) else np.asarray(indices, dtype=np.int32)
+            dense_fp = np.zeros((1, 2048), dtype=np.float32)
+            dense_fp[0, idx] = 1.0
+            fetched_batch.append((z, s, dense_fp))
         else:
-            if zinc_id not in used_zinc_ids:
-                smiles_list.append(smiles) 
-                zinc_list.append(zinc_id)
-    
+            zinc_list.append(z); smiles_list.append(s)
+
     if not fingerprint:
-        dense_fp = tokenizer(smiles_list, padding=True, truncation=True, return_tensors="pt")
-        fetched_batch = (zinc_list, smiles_list, dense_fp)
-        # print('fetched batch', fetched_batch)
-        # print(len(zinc_list), len(smiles_list))
-        # print(dense_fp)
-        # # assert len(zinc_list)==len(smiles_list)==len(dense_fp)
-        # fetched_batch.append((zinc_id, smiles, fp) for zinc_id, smiles, fp in zip(zinc_list, smiles_list, dense_fp))
-    data_finish_flag = (offset>0) and (len(fetched_batch[0])%offset!=0) 
-    print(f'Returning {len(fetched_batch[0])} unlabeled examples from fetch_unlabeled_batch() offset ', offset, (len(fetched_batch[0])%offset!=0) )
-    return fetched_batch, len(available_df), data_finish_flag
+        token_batch = tokenizer(smiles_list, padding=True, truncation=True, return_tensors="pt")
+        fetched_batch = (zinc_list, smiles_list, token_batch)
+
+    return fetched_batch, len_available, data_finish_flag
 
 
 def run_inference(model, molecule_df, batch_size, top_k, used_zinc_ids, config, validation_dock_labels, pred_val_proba, tokenizer=None):
@@ -396,7 +661,7 @@ def run_inference(model, molecule_df, batch_size, top_k, used_zinc_ids, config, 
         # unlabeled_batch = fetch_unlabeled_batch(batch_size, offset, molecule_df, used_zinc_ids)
         # Model prediction and scoring
         if config.global_params.model_architecture in ('mlpTx','mlp3K'):
-            unlabeled_batch, len_av_df = fetch_unlabeled_batch(batch_size, offset, molecule_df, used_zinc_ids, fingerprint=True, tokenizer=tokenizer)
+            unlabeled_batch, len_av_df = fetch_unlabeled_batch(batch_size, offset, molecule_df, used_zinc_ids, fingerprint=True, tokenizer=tokenizer, config=config)
             mol_ids, smiles_list, features = zip(*unlabeled_batch)
             features = np.vstack(features)
             dataset = TensorDataset(
@@ -412,7 +677,7 @@ def run_inference(model, molecule_df, batch_size, top_k, used_zinc_ids, config, 
             pred_labels, pred_proba, scores = predict_with_model(model, dataloader, 
                                                              acquisition_function=config.al_params.acquisition_function)  # scores is uncertainty (or acquisition score)
         elif config.global_params.model_architecture in ('molformer', 'enhanced_molformer', 'advanced_molformer'):
-            unlabeled_batch, len_av_df, has_data_finshed = fetch_unlabeled_batch(batch_size, offset, molecule_df, used_zinc_ids, fingerprint=False, tokenizer=tokenizer)
+            unlabeled_batch, len_av_df, has_data_finshed = fetch_unlabeled_batch(batch_size, offset, molecule_df, used_zinc_ids, fingerprint=False, tokenizer=tokenizer, config=config)
             mol_ids, smiles_list, molformer_features = unlabeled_batch
             # molformer_features = (
             #     model.module.tokenizer(smiles_list, padding=True, truncation=True, return_tensors="pt")
@@ -503,7 +768,7 @@ def run_inference(model, molecule_df, batch_size, top_k, used_zinc_ids, config, 
     while len(random_samples) < top_k//10:
         # print('mainvina.py len(rand_samples) ', len(random_samples), f'Fetching rand low uncertain test samples from DB; need {top_k//10 - len(random_samples)} more samples')
         if config.global_params.model_architecture in ('mlp3K', 'mlpTx'):
-            rand_batch, used_zinc_ids = fetch_random_batch(top_k, molecule_df, used_zinc_ids, fingerprint=True, tokenizer=tokenizer)  # Fetch a batch of random molecules
+            rand_batch, used_zinc_ids = fetch_random_batch(top_k, molecule_df, used_zinc_ids, fingerprint=True, tokenizer=tokenizer, config=config)  # Fetch a batch of random molecules
             rand_test_smiles = [item[1] for item in rand_batch]
             rand_test_features = [item[2] for item in rand_batch] #molids_2_fps(cursor, [item[0] for item in rand_batch])  # Convert to features
             dataset = TensorDataset(
@@ -523,7 +788,7 @@ def run_inference(model, molecule_df, batch_size, top_k, used_zinc_ids, config, 
             ) 
             
         elif config.global_params.model_architecture in ('molformer', 'enhanced_molformer', 'advanced_molformer'):
-            rand_batch, used_zinc_ids = fetch_random_batch(top_k, molecule_df, used_zinc_ids, fingerprint=False, tokenizer=tokenizer)  # Fetch a batch of random molecules
+            rand_batch, used_zinc_ids = fetch_random_batch(top_k, molecule_df, used_zinc_ids, fingerprint=False, tokenizer=tokenizer, config=config)  # Fetch a batch of random molecules
             rand_test_smiles = rand_batch[1] # [item[1] for item in rand_batch]
             molformer_features = rand_batch[2] #[item[2] for item in rand_batch]
             # molformer_features = (
@@ -812,7 +1077,7 @@ def run_subsequent_iterations_mul_gpu(initial_model, molecule_df, dd_cutoff, it0
         cutoff_fn_al = VirtHitsCutoff(cutoff_percent=1)
         dd_cutoff = it0cutoff = cutoff_fn_al.getCutoff(it0_data.train.dock_scores, fixed = False) #prev_dd_cutoff
 
-    with wandb.init(project = 'DDS_AL_2M_AllTgt',
+    with wandb.init(project = config.global_params.expt_name,
                     config = config, mode = None): #None
         print(wandb.run.id, wandb.run.name)
         wandb.run.name=f'{config.global_params.model_architecture}_{config.global_params.target}_{config.al_params.acquisition_function}_dropDB{config.al_params.drop_db}_fxcut{config.threshold_params.fixed_cutoff}_{wandb.run.name}'
@@ -857,6 +1122,8 @@ def run_subsequent_iterations_mul_gpu(initial_model, molecule_df, dd_cutoff, it0
             print(f"Iteration {iteration}/{num_iterations}")
             # Inference to acquire top-k molecules. For decaying acq size do top_k//iteration
             num_tasks = config.model_hps.num_gpus
+            is_dask = hasattr(molecule_df, "compute") and "dask" in type(molecule_df).__module__
+
             if num_tasks>1:
                 iteration_dir = os.path.join(config.global_params.project_path, 
                                         config.global_params.project_name, f'iteration_{iteration}')
@@ -864,42 +1131,83 @@ def run_subsequent_iterations_mul_gpu(initial_model, molecule_df, dd_cutoff, it0
                 clear_iter(os.path.join(config.global_params.project_path, 
                                     config.global_params.project_name, f'iteration_{iteration-1}'))
                 
-                if config.al_params.drop_db:
-                    available_df =  molecule_df[~molecule_df['zinc_id'].isin(used_zinc_ids)]
+                if is_dask:
+                    import dask.dataframe as dd
+                    if config.al_params.drop_db:
+                        avail_ddf = molecule_df[~molecule_df["zinc_id"].isin(list(used_zinc_ids))]  # lazy filter
+                    else:
+                        avail_ddf = molecule_df
+
+                    if config.al_params.subset_inference and iteration != num_iterations - 1:
+                        # pull a small random pandas sample for this iteration (<= 1M)
+                        n = 10_000_000
+                        available_df = _to_pandas_batch_duckdb(config.global_params.dataset_path, n=n, random_state=iteration)
+                        total_mols = len(available_df)
+
+                        # split WITHOUT converting to numpy (lighter memory than .to_numpy())
+                        splits = np.array_split(available_df.index.to_numpy(), num_tasks)
+                        for task_id, idx in enumerate(splits):
+                            split_molecule_df = available_df.loc[idx].reset_index(drop=True)
+                            pickle.dump(split_molecule_df, open(os.path.join(iteration_dir, f"split_mol_df_{task_id}.pkl"), "wb"))
+                        with open(os.path.join(iteration_dir, "used_zinc_ids.pkl"), "wb") as f:
+                            pickle.dump(used_zinc_ids, f)
+
+                    else:
+                        # full library: stream per-partition to pickles, no giant materialization
+                        parts = avail_ddf.repartition(npartitions=num_tasks).to_delayed()
+                        for task_id, dpart in enumerate(parts):
+                            split_molecule_df = dpart.compute()  # pandas chunk for this task
+                            pickle.dump(split_molecule_df, open(os.path.join(iteration_dir, f"split_mol_df_{task_id}.pkl"), "wb"))
+                        with open(os.path.join(iteration_dir, "used_zinc_ids.pkl"), "wb") as f:
+                            pickle.dump(used_zinc_ids, f)
+
+                    parallel_inf_sh_path = write_inf_helper_script(iteration_dir, config)
+                    cmd = ["sbatch", parallel_inf_sh_path]
+                    sbatch_output = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    wait_for_slurm_completion(sbatch_output)
+
+                    # Then gather as you already do:
+                    inf_res, used_zinc_ids = results_gather(iteration_dir, top_k, molecule_df)
+                    top_k_molecules, len_av_df = inf_res['top_acq_mols'], inf_res['len_av_df']
+
                 else:
-                    available_df = molecule_df
 
-                # last iteration uses full available_df; if subset_inference is True, then use 10M or less molecules for inference
-                if config.al_params.subset_inference and iteration != num_iterations - 1:
-                    n = min(1_000_000, len(available_df))
-                    available_df = available_df.sample(n=n, random_state=iteration)
+                    if config.al_params.drop_db:
+                        available_df =  molecule_df[~molecule_df['zinc_id'].isin(used_zinc_ids)]
+                    else:
+                        available_df = molecule_df
 
-                available_df_numpy_array = available_df.to_numpy()
-                for task_id in range(0, config.model_hps.num_gpus):
-                    # Split dataset for parallel processing
-                    print('drop db is ',  config.al_params.drop_db )
-                    
-                    total_mols = len(available_df)
-                    chunk_size = (total_mols + num_tasks - 1) // num_tasks  # Ensure even splitting
-                    start_idx = task_id * chunk_size
-                    end_idx = min((task_id + 1) * chunk_size, total_mols)
-                    # split_molecule_df = available_df.iloc[start_idx:end_idx]  # Process only assigned chunk
-                    # split_molecule_df = pd.DataFrame(available_df.values[start_idx:end_idx], columns=available_df.columns)
-                    split_molecule_df = pd.DataFrame(available_df_numpy_array[start_idx:end_idx], columns=available_df.columns)
-                    print(f"SLURM Task {task_id}: Processing molecules {start_idx} to {end_idx}")
-                    # split_molecule_df.to_csv(iteration_dir+f'/split_mol_df_{task_id}.csv', index=False)
-                    pickle.dump(split_molecule_df, open(iteration_dir+f'/split_mol_df_{task_id}.pkl','wb'))
-                    with open(iteration_dir+'/used_zinc_ids.pkl','wb') as f:
-                        pickle.dump(used_zinc_ids, f)
-                parallel_inf_sh_path = write_inf_helper_script(iteration_dir, config)
-                cmd = ["sbatch", parallel_inf_sh_path ]
-                sbatch_output = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                wait_for_slurm_completion(sbatch_output)
+                    # last iteration uses full available_df; if subset_inference is True, then use 10M or less molecules for inference
+                    if config.al_params.subset_inference and iteration != num_iterations - 1:
+                        n = min(10_000_000, len(available_df))
+                        available_df = available_df.sample(n=n, random_state=iteration)
 
-                # TODO aggregate results of split_mol_df inference to get top_k_molecules, rand_virtual_hits, rand_test_samples, len_av_df
-                inf_res, used_zinc_ids = results_gather(iteration_dir, top_k, molecule_df)
-                top_k_molecules, len_av_df = inf_res['top_acq_mols'], inf_res['len_av_df']
-                print('top_k_molecules after gather ', len(top_k_molecules), 'used zinc ids ', len(used_zinc_ids),'available df ', len_av_df)
+                    available_df_numpy_array = available_df.to_numpy()
+                    for task_id in range(0, config.model_hps.num_gpus):
+                        # Split dataset for parallel processing
+                        print('drop db is ',  config.al_params.drop_db )
+                        
+                        total_mols = len(available_df)
+                        chunk_size = (total_mols + num_tasks - 1) // num_tasks  # Ensure even splitting
+                        start_idx = task_id * chunk_size
+                        end_idx = min((task_id + 1) * chunk_size, total_mols)
+                        # split_molecule_df = available_df.iloc[start_idx:end_idx]  # Process only assigned chunk
+                        # split_molecule_df = pd.DataFrame(available_df.values[start_idx:end_idx], columns=available_df.columns)
+                        split_molecule_df = pd.DataFrame(available_df_numpy_array[start_idx:end_idx], columns=available_df.columns)
+                        print(f"SLURM Task {task_id}: Processing molecules {start_idx} to {end_idx}")
+                        # split_molecule_df.to_csv(iteration_dir+f'/split_mol_df_{task_id}.csv', index=False)
+                        pickle.dump(split_molecule_df, open(iteration_dir+f'/split_mol_df_{task_id}.pkl','wb'))
+                        with open(iteration_dir+'/used_zinc_ids.pkl','wb') as f:
+                            pickle.dump(used_zinc_ids, f)
+                    parallel_inf_sh_path = write_inf_helper_script(iteration_dir, config)
+                    cmd = ["sbatch", parallel_inf_sh_path ]
+                    sbatch_output = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    wait_for_slurm_completion(sbatch_output)
+
+                    # TODO aggregate results of split_mol_df inference to get top_k_molecules, rand_virtual_hits, rand_test_samples, len_av_df
+                    inf_res, used_zinc_ids = results_gather(iteration_dir, top_k, molecule_df)
+                    top_k_molecules, len_av_df = inf_res['top_acq_mols'], inf_res['len_av_df']
+                    print('top_k_molecules after gather ', len(top_k_molecules), 'used zinc ids ', len(used_zinc_ids),'available df ', len_av_df)
 
             else:
                 inf_res, used_zinc_ids = run_inference(model, molecule_df, batch_size, top_k//1, used_zinc_ids, config, validation_dock_labels, pred_val_proba, tokenizer=tokenizer) # acquire topk, then topk/2, then topk/3,...., to not change the training distribution too much from apriori (real-world) distribution
@@ -941,22 +1249,6 @@ def run_subsequent_iterations_mul_gpu(initial_model, molecule_df, dd_cutoff, it0
             # print('main vina new_features[0:3]', new_features[0:3])
                 assert len(new_docking_scores)== len(new_features['input_ids'])
             print(f"Acquired {len(new_data)} molecules (b4 0dock filtering) for Iteration {iteration + 1} ")
-
-
-            # # Model validation of virtual hits
-            # # vina = QuickVina2GPU(vina_path="/groups/cherkasvgrp/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1", #QuickVina2-GPU-2-1"', # Avoiding global initialization because _teardown deletes tmp dirs
-            # #                     target=config.global_params.target)
-            # val_docking_scores = get_vina_scores_mul_gpu([item[1] for item in rand_virtual_hits], molecule_df, config, num_gpus=config.model_hps.num_gpus, 
-            #                                             output_dir=f"{config.global_params.project_path}/{config.global_params.project_name}/iteration_{iteration}/vina_results",
-            #                                             dockscore_gt=smiles_2_dockscore_gt)
-            # val_docking_scores = [smiles_2_dockscore_gt[item[1]] for item in rand_virtual_hits]
-            # if config.global_params.model_architecture in ('mlp3K','mlpTx'):
-            #     val_features = molids_2_fps(molecule_df=molecule_df, mol_ids= [item[0] for item in rand_virtual_hits], fast=True)
-            # elif config.global_params.model_architecture in ('advanced_molformer'):
-            #     val_features = tokenizer([item[1] for item in rand_virtual_hits], padding=True, truncation=True, return_tensors="pt")
-            #     assert len(val_docking_scores)==len(val_features['input_ids'])
-            # # print('mainvina.py val_docking_scores ', val_docking_scores, len(val_docking_scores))
-
            
             #augment train dataset with new acquired data
             # Filter molecules with docking_score < 0
@@ -973,26 +1265,7 @@ def run_subsequent_iterations_mul_gpu(initial_model, molecule_df, dd_cutoff, it0
                                     'dock_scores': filtered_scores, #new_docking_scores,
                                     'smiles': filtered_smiles #[item[1] for item in new_data]
                                     },
-
-                                    
-                        # 'validation':{'mol_ids':it0_data.test.mol_ids, #Considering apriori test set as validation
-                        #               'features':it0_data.test.features,
-                        #               'dock_scores':it0_data.test.dock_scores,
-                        #               'smiles': it0_data.test.smiles
-                        #             }
                             })
-            
-            # # Create a reduced version of the data
-            # reduced_data = EasyDict({'train': {'mol_ids': new_it_data.train.mol_ids,
-            #                                 'dock_scores': new_it_data.train.dock_scores},
-            #                         'validation': {'mol_ids': new_it_data.validation.mol_ids,
-            #                                         'dock_scores': new_it_data.validation.dock_scores}})
-
-            # # Save the reduced data to a .pkl file
-            # output_path = f"{config.global_params.project_path}/{config.global_params.project_name}/iteration_{iteration}/acquired_data_reduced.pkl"
-            # with open(output_path, 'wb') as f:
-            #     pickle.dump(reduced_data, f)
-                
 
             prev_it_data = train_data_class[iteration-1]
             # print(prev_it_data.train.features.shape, np.vstack(new_it_data.train.features).shape)
