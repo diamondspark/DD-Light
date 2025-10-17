@@ -64,7 +64,7 @@ def sample_n_parquet_duckdb(parquet_path_or_glob: str,
     if threads is None:
         threads = os.cpu_count() or 1
     con.execute(f"PRAGMA threads={int(threads)}")
-    con.execute("SET enable_progress_bar=true")
+    # con.execute("SET enable_progress_bar=true")
 
     if seed is None:
         seed = 0
@@ -173,8 +173,6 @@ def fetch_random_splits(
       - Rows in used_zinc_ids are excluded before sampling.
       - If init_acq=True, sampled zinc_ids are added to used_zinc_ids.
     """
-    import numpy as np
-    import pandas as pd
 
     total_needed = int(train_n) + int(val_n) + int(test_n)
     if total_needed <= 0:
@@ -500,10 +498,15 @@ def run_first_iteration(config, total_size, molecule_df, used_zinc_ids, smiles_2
         fingerprint = True 
     elif config.global_params.model_architecture in ('advanced_molformer'):
         fingerprint = False
-    train_batch,used_zinc_ids = fetch_random_batch(total_size, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer = tokenizer, config=config)
-    val_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_val_budget, molecule_df, used_zinc_ids, init_acq= True, fingerprint=fingerprint, tokenizer=tokenizer, config=config)
-    test_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_test_budget, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer=tokenizer, config=config)
-    
+    # train_batch,used_zinc_ids = fetch_random_batch(total_size, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer = tokenizer, config=config)
+    # val_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_val_budget, molecule_df, used_zinc_ids, init_acq= True, fingerprint=fingerprint, tokenizer=tokenizer, config=config)
+    # test_batch,used_zinc_ids = fetch_random_batch(config.al_params.initial_test_budget, molecule_df, used_zinc_ids, init_acq=True, fingerprint=fingerprint, tokenizer=tokenizer, config=config)
+    (train_batch, val_batch, test_batch), used_zinc_ids = fetch_random_splits(
+        config.al_params.initial_budget, config.al_params.initial_val_budget, config.al_params.initial_test_budget,
+        molecule_df, used_zinc_ids,
+        fingerprint=fingerprint, init_acq=True, tokenizer=tokenizer, config=config, random_state=420
+    )
+
     print("First Iteration:")
     print(f"Train Batch Size: {len(train_batch[0])}")
     print(f"Validation Batch Size: {len(val_batch[0])}")

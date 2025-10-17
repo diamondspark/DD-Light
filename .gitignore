@@ -8,3 +8,5 @@ __pycache__
 *.log
 *.txt 
 wandb/
+results/
+plots/
