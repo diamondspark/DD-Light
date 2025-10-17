@@ -112,6 +112,31 @@ def load_all_virtual_hits_parallel(iteration_dir, workers=None, chunksize=8, pro
     return out
 
 
+def fetch_probs():
+    import os
+
+    iteration = 4
+    iteration_dir = os.path.join(config.global_params.project_path, 
+                                     config.global_params.project_name, f'iteration_{iteration}')
+        
+    topkdf = pd.read_csv(f"{iteration_dir}/final_dock_res.csv")
+    vhits = load_all_virtual_hits_parallel(iteration_dir, chunksize=1)
+    vh_df = pd.DataFrame(vhits, columns=["mol_id", "smiles", "proba"])
+    if vh_df["mol_id"].duplicated().any():
+        print("There are duplicate mol_ids in the virtual hits")
+
+
+    # 3) Attach proba by key — use a map (fast) or merge (equivalent)
+    proba_by_id = pd.Series(vh_df["proba"].values, index=vh_df["mol_id"])
+    topkdf["proba"] = topkdf["mol_id"].map(proba_by_id)
+
+    # 4) Quick sanity check
+    matched = topkdf["proba"].notna().sum()
+    print(f"[join] matched probabilities for {matched:,} / {len(topkdf):,} rows")
+
+    # 5) Save cleanly (retain dock-score sort; no index column)
+    topkdf.to_csv(f"{iteration_dir}/final_dock_proba_res.csv", index=False)
+
 
 def main():
     import pickle
